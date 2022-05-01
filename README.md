@@ -3,7 +3,7 @@
 To run GeneticCF, you need to have Julia installed ([link](https://julialang.org/downloads/)). Then you can run the following commands to load the package GeCo, which we used as the underneath counterfactual explanation system.
 
 ```Julia
-using Pkg; Pkg.activate("./GeCo.jl")
+using Pkg; Pkg.activate("./GeCo")
 using GeCo
 ```
 
