@@ -1,3 +1,5 @@
+# using Pkg; Pkg.activate(".")
+# using GeCo
 
 using DataFrames, Statistics, MLJScientificTypes
 import StatsBase
@@ -159,6 +161,7 @@ function sort_action_cardinality(action)
 end  
 
 function generate_rules(orig_instance::DataFrameRow, data::DataFrame, classifier, plaf_program::PLAFProgram; 
+    epslin::Float64 = 0.0,
     max_num_population::Int64 = 50,
     geco_initial::Bool = false,
     geco_mutation::Bool = false,
@@ -166,9 +169,9 @@ function generate_rules(orig_instance::DataFrameRow, data::DataFrame, classifier
     max_generation::Int64 = 50,
     sample_num::Int64 = 1000,
     geco_check_size::Int64 = 5,
+    reduction = false,
     ablation::Bool = false)
 
-    epslin = 0.0
     if !ablation
         groups::Array{RuleFeatureGroup, 1}, fidx_gidx::Vector{Int32} = initRuleFeatureGroups(plaf_program, data)
         components::Array{RuleComponent, 1} = initailComponents(groups)
@@ -198,8 +201,12 @@ function generate_rules(orig_instance::DataFrameRow, data::DataFrame, classifier
 
         while generation < max_generation && (!converge || length(population) < 1 || population[1].precision < 1 - epslin) 
             generation += 1
+
             # println(generation)
-            # println(length(population))
+            # println(length(checked_set))
+            # for rule_i in population
+            #     print_rule(orig_instance, rule_i)
+            # end
 
             if geco_mutation && generation - last_geco > 3
                 last_geco = generation
@@ -207,6 +214,8 @@ function generate_rules(orig_instance::DataFrameRow, data::DataFrame, classifier
                 # @time mutation_geco!(population, checked_set, data, orig_instance, classifier, plaf_program, fidx_gidx, components, generation, desired_class = desired_class, check_size = geco_check_size)
                 mutation_geco!(population, checked_set, data, orig_instance, classifier, plaf_program, fidx_gidx, components, generation, desired_class = desired_class, check_size = geco_check_size)
             end
+
+            # println(length(population))
 
             ori_pop_size = length(population)
 
@@ -233,6 +242,10 @@ function generate_rules(orig_instance::DataFrameRow, data::DataFrame, classifier
         
         end
 
+        if geco_mutation && reduction
+            geco_reduction!(population, plaf_program, orig_instance, data, classifier, desired_class)
+        end
+
         return population, generation
     else
         prep_time = 0.0
@@ -243,6 +256,7 @@ function generate_rules(orig_instance::DataFrameRow, data::DataFrame, classifier
         geco_mutation_time = 0.0
         num_explored = 0
         num_explored_geco = 0
+        reduction_time = 0.0
 
         ptime = @elapsed groups, fidx_gidx = initRuleFeatureGroups(plaf_program, data)
         components = initailComponents(groups)
@@ -323,10 +337,14 @@ function generate_rules(orig_instance::DataFrameRow, data::DataFrame, classifier
                 end
 
             end
-        
+
         end
 
-        return population, generation, num_explored + num_explored_geco, num_explored_geco, prep_time, selection_time, mutation_time, crossover_time, geco_init_time, geco_mutation_time
+        if geco_mutation && reduction
+            reduction_time = @elapsed geco_reduction!(population, plaf_program, orig_instance, data, classifier, desired_class)
+        end
+
+        return population, generation, num_explored + num_explored_geco, num_explored_geco, prep_time, selection_time, mutation_time, crossover_time, geco_init_time, geco_mutation_time, reduction_time
     end
 end
 
@@ -811,13 +829,14 @@ function rule_to_constrain(rule::Rule, plaf_program::PLAFProgram, orig_instance:
 
         # add constrain for each feature in the group
         for (fidx, feature) in zip(rule_component.group.indexes, rule_component.group.features)
-            c = Int64(orig_instance[feature])
+            # c = Int64(orig_instance[feature])
+            c = orig_instance[feature]
             if direction == 2 # == 
-                plaf = @PLAF(plaf, :cf.aa .== parse(Int64, "$c"))
+                plaf = @PLAF(plaf, :cf.aa .== parse(Float64, "$c"))
             elseif direction == 1 # <=
-                plaf = @PLAF(plaf, :cf.aa .<= parse(Int64, "$c"))
+                plaf = @PLAF(plaf, :cf.aa .<= parse(Float64, "$c"))
             else # >=
-                plaf = @PLAF(plaf, :cf.aa .>= parse(Int64, "$c"))
+                plaf = @PLAF(plaf, :cf.aa .>= parse(Float64, "$c"))
             end
 
             cur_index = length(plaf.constraints)
@@ -846,11 +865,12 @@ function check_converge(population::Array{Rule, 1}, generation::Int64, geco_muta
 
         if i >= 3 && population[1].geco_verified
             return true
-        else
-            if i >= 5
-                return true
-            end
         end
+        
+        if i >= 5
+            return true
+        end
+        
 
         i += 1
     end
@@ -858,7 +878,7 @@ function check_converge(population::Array{Rule, 1}, generation::Int64, geco_muta
     return true
 end
 
-function greedyCF(orig_instance::DataFrameRow, data::DataFrame, classifier, plaf_program::PLAFProgram; desired_class = 1)
+function geco_for_rule(orig_instance::DataFrameRow, data::DataFrame, classifier, plaf_program::PLAFProgram; desired_class = 1)
 
     groups::Array{RuleFeatureGroup, 1}, fidx_gidx::Vector{Int32} = initRuleFeatureGroups(plaf_program, data)
     components::Array{RuleComponent, 1} = initailComponents(groups)
@@ -871,6 +891,7 @@ function greedyCF(orig_instance::DataFrameRow, data::DataFrame, classifier, plaf
     num_exp = 1
 
     while true
+        # println(num_exp)
         rule::Rule = pop!(population)
         num_exp += 1
         p_cur, action_components = rule_to_constrain(rule, plaf_program,orig_instance)
@@ -891,6 +912,59 @@ function greedyCF(orig_instance::DataFrameRow, data::DataFrame, classifier, plaf
         
         sort!(population, by = sort_rule_cardinality, rev = true)
     end
+end
+
+function geco_reduction!(population::Array{Rule, 1}, plaf_program::PLAFProgram, orig_instance::DataFrameRow, data::DataFrame, classifier, desired_class) 
+    rule_new = check_redundancy(population[1], plaf_program, orig_instance, data, classifier, desired_class)
+
+    while rule_new !== nothing
+        pushfirst!(population, rule_new)
+        rule_new = check_redundancy(population[1], plaf_program, orig_instance, X, classifier, desired_class)
+    end
+end
+
+
+function check_redundancy(rule::Rule, plaf_program::PLAFProgram, orig_instance::DataFrameRow, data::DataFrame, classifier, desired_class)
+    if length(rule.rule_components) == 1
+        return nothing
+    end
+    for idx in 1 : length(rule.rule_components)
+        rule_new = deepcopy(rule)
+        deleted_component = rule.rule_components[idx]
+        deleteat!(rule_new.rule_components, idx)
+        rule_new.bit_representation[deleted_component.index] = false
+
+        # we want to remove this rule components and check
+        if deleted_component.group.categorical
+            # this is categorical and we should remove both
+            if deleted_component.index % 2 == 0
+                continue
+            end
+        
+
+            # delete the dual one
+            for (dual_idx, dual_rule_component) in enumerate(rule_new.rule_components)
+                if dual_rule_component.group_index == deleted_component.group_index
+                    rule_new.bit_representation[dual_rule_component.index] = false  
+                    deleteat!(rule_new.rule_components, dual_idx)
+                    break
+                end
+            end
+        end
+
+        # check whether the new rule is sound
+        p, action_components = rule_to_constrain(rule_new, plaf_program, orig_instance)
+
+        # print("explain")
+        explains, = explain(orig_instance, data, p, classifier, desired_class = desired_class)
+        if size(explains)[1] == 0 || !explains[1,:outc]
+            rule_new.geco_verified = true
+            rule_new.precision = 1.0
+            return rule_new
+        end
+    end
+
+    return nothing
 end
 
 
